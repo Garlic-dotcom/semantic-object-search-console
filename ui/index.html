@@ -4,19 +4,68 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light">
+  <meta name="description" content="家庭机器人控制台，可查看实时地图、下达任务和检查运行状态。">
+  <meta name="theme-color" content="#f5f5f7">
   <title>家庭机器人 · 控制台</title>
   <link rel="stylesheet" href="/style.css">
   <script defer src="/app.js"></script>
 </head>
 <body>
+  <a class="skip-link" href="#workbench">跳到工作区</a>
   <header class="topbar">
-    <div class="brand"><span class="brand-icon" aria-hidden="true">⌂</span><div><h1>家庭机器人</h1><p>HOME ROBOT · 本地控制台</p></div></div>
-    <div class="top-status"><span id="connection" class="badge neutral">正在连接</span><span id="phase" class="phase">读取系统状态…</span></div>
+    <div class="topbar-inner">
+      <a class="brand" data-page-link href="#simulation"><span class="brand-icon" aria-hidden="true"></span>家庭机器人</a>
+      <nav class="top-nav" aria-label="工作台页面">
+        <span class="nav-selection" aria-hidden="true"></span>
+        <a data-page-link href="#simulation" aria-current="page">仿真</a>
+        <a data-page-link href="#tasks">任务</a>
+        <a data-page-link href="#map-card">地图</a>
+        <a data-page-link href="#diagnostics">诊断</a>
+      </nav>
+      <div class="top-status">
+        <span id="connection" class="badge neutral">正在连接</span>
+        <button id="stop-from-page" class="quick-stop" type="button" hidden>停止任务</button>
+      </div>
+    </div>
   </header>
-  <main>
+  <main id="workbench">
+    <div class="page-heading">
+      <div><h1 id="page-title">仿真工作台</h1><p id="phase" class="phase">读取系统状态…</p></div>
+      <div class="page-arrows" role="group" aria-label="切换页面">
+        <button id="previous-page" type="button" aria-label="上一页" title="上一页" disabled>‹</button>
+        <button id="next-page" type="button" aria-label="下一页" title="下一页">›</button>
+      </div>
+    </div>
     <div id="notice" class="notice" role="status" hidden></div>
-    <div class="workspace">
-      <aside class="sidebar">
+    <div id="console-pages">
+      <div class="console-page simulation-page" data-console-page="simulation">
+        <section id="simulation" class="simulator" aria-labelledby="simulation-title">
+          <div class="simulator-bar">
+            <div><h2 id="simulation-title">Gazebo 仿真</h2><p id="simulation-status">正在连接画面</p></div>
+            <div class="camera-tabs" role="group" aria-label="仿真视角">
+              <button type="button" data-camera="overview" aria-pressed="false" disabled>全屋</button>
+              <button type="button" data-camera="robot" aria-pressed="true">机器人</button>
+            </div>
+          </div>
+          <div id="simulation-view" class="simulation-view">
+            <img id="simulation-image" alt="Gazebo 实时仿真画面" hidden>
+            <div id="simulation-empty" class="simulation-empty">
+              <p>正在接收 Gazebo 画面</p>
+              <a data-page-link href="#map-card">查看导航地图</a>
+            </div>
+          </div>
+        </section>
+        <section class="avoidance-panel" data-state="stale" aria-label="实时避障观察">
+          <div class="avoidance-heading"><span id="obstacle-symbol" class="avoidance-symbol" aria-hidden="true">⌖</span><div class="avoidance-heading-text"><span class="avoidance-eyebrow">实时避障观察</span><h3 id="obstacle-heading">等待有效观测</h3></div><span id="obstacle-badge" class="badge neutral">等待数据</span></div>
+          <div class="avoidance-facts">
+            <div class="avoidance-metric"><span id="obstacle-sector">当前方向最近障碍</span><strong id="obstacle-distance">— m</strong><span id="obstacle-bearing">方位 —</span></div>
+            <div class="avoidance-metric"><span>机器人实测速度</span><strong id="obstacle-speed">— m/s</strong><span id="obstacle-turn">转速 — rad/s</span></div>
+          </div>
+          <div class="avoidance-event-heading">最近观察<span>本次运行 · 自动更新</span></div><ul id="obstacle-events" class="avoidance-events"><li>暂无记录</li></ul>
+          <details class="avoidance-details"><summary>观测说明</summary><p id="obstacle-note" class="small muted">读取实际激光和运动数据。</p></details>
+        </section>
+      </div>
+      <div class="console-page task-page" data-console-page="tasks" hidden>
         <section class="card task-card">
           <div class="section-head"><h2>下达任务</h2><span id="robot-mode" class="eyebrow">导航模式</span></div>
           <button id="switch-mode" class="button secondary" type="button" disabled>进入建图</button>
@@ -29,6 +78,7 @@
               <div class="form-pair"><div><label for="room">房间</label><select id="room" name="room"><option value="kitchen">厨房</option><option value="living">客厅</option><option value="bedroom">卧室</option><option value="gym">健身区</option><option value="utility">杂物间</option></select></div><div id="category-field"><label for="category">物品</label><select id="category" name="category"><option value="cup">杯子</option><option value="bottle">瓶子</option><option value="chair">椅子</option></select></div></div>
               </div>
               <div id="mapping-fields" hidden>
+                <p class="small muted">按住方向键或 W/A/S/D 移动，松开或按空格停车。</p>
                 <div class="motion-pad">
                   <button class="button secondary" type="button" data-motion="前进">前进</button>
                   <button class="button secondary" type="button" data-motion="后退">后退</button>
@@ -38,6 +88,7 @@
                   <button class="button secondary" type="button" data-motion="减速">减速</button>
                 </div>
                 <button id="detour" class="button secondary" type="button" data-motion="绕行">尝试绕行</button>
+                <button id="open-nearby-door" class="button secondary" type="button" data-motion="开门" hidden>打开附近的门</button>
                 <button id="save-mapping" class="button secondary" type="button">保存地图</button>
                 <p id="motion-status" class="small muted" aria-live="polite"></p>
               </div>
@@ -47,45 +98,15 @@
               <button id="submit-task" class="button primary" type="submit" disabled>等待系统就绪</button>
             </fieldset>
           </form>
+          <div class="task-actions">
           <button id="record-voice" class="button secondary" type="button" disabled>录音转写</button>
           <button id="return-to-dock" class="button secondary" type="button" disabled hidden>返回充电处</button>
+          </div>
           <button id="cancel-task" class="button stop" type="button">停止当前任务</button>
           <p id="task-help" class="small muted">就绪后可开始。每次执行一个任务。</p>
         </section>
-        <section class="card">
-          <div class="section-head"><h2>系统状态</h2><span id="system-dot" class="dot neutral" aria-label="状态未知"></span></div>
-          <ul id="health" class="health-list"><li><span>机器人连接</span><span class="muted">等待数据</span></li></ul>
-          <details class="topic-details"><summary>传感器数据</summary><ul id="topics" class="topic-list"></ul></details>
-          <button id="validate" class="button secondary" type="button" disabled>检查传感器</button>
-          <p id="validation-state" class="small muted">检查会保存传感器报告，不移动机器人。</p>
-          <div id="validation-artifacts" class="artifact-list"></div>
-        </section>
-      </aside>
-      <section class="card map-card">
-        <div class="section-head map-heading"><div><h2 id="map-title">家庭地图</h2><p id="map-meta" class="small muted">等待地图数据</p></div><div class="map-tools"><button id="zoom-out" type="button" title="缩小地图" aria-label="缩小地图">−</button><button id="zoom-in" type="button" title="放大地图" aria-label="放大地图">＋</button><button id="fit-map" type="button">适应</button></div></div>
-        <div class="map-view-tabs" role="group" aria-label="地图视图"><button type="button" data-map-view="semantic" aria-pressed="true">语义地图</button><button type="button" data-map-view="operation" aria-pressed="false">运行地图</button><button type="button" data-map-view="relations" aria-pressed="false">房间与物品关系</button></div>
-        <section class="avoidance-panel" data-state="stale" aria-label="实时避障观察">
-          <div class="avoidance-heading"><span id="obstacle-symbol" class="avoidance-symbol" aria-hidden="true">⌖</span><div class="avoidance-heading-text"><span class="avoidance-eyebrow">实时避障观察</span><h3 id="obstacle-heading">等待有效观测</h3></div><span id="obstacle-badge" class="badge neutral">等待数据</span></div>
-          <div class="avoidance-facts">
-            <div class="avoidance-metric"><span id="obstacle-sector">当前方向最近障碍</span><strong id="obstacle-distance">— m</strong><span id="obstacle-bearing">方位 —</span></div>
-            <div class="avoidance-metric"><span>机器人实测速度</span><strong id="obstacle-speed">— m/s</strong><span id="obstacle-turn">转速 — rad/s</span></div>
-          </div>
-          <div class="avoidance-event-heading">最近观察<span>本次运行 · 自动更新</span></div><ul id="obstacle-events" class="avoidance-events"><li>暂无记录</li></ul>
-          <details class="avoidance-details"><summary>观测说明</summary><p id="obstacle-note" class="small muted">读取实际激光和运动数据。</p></details>
-        </section>
-        <div id="semantic-summary" class="semantic-summary" aria-live="polite"></div>
-        <div class="region-controls"><label><input id="show-regions" type="checkbox" checked> 区域轮廓</label><label><input id="show-views" type="checkbox"> 预设巡视点与朝向</label><label><input id="show-memory" type="checkbox" checked> 物品记忆</label><span id="region-note">区域边界可通行，不是墙体</span></div>
-        <p id="view-note" class="view-note" hidden>预设巡视路线，非实时检测位置。</p>
-        <div class="region-controls"><label><input id="show-obstacles" type="checkbox" checked> 实时激光与规划路径</label><span>橙色点为实测障碍，蓝色虚线为规划路径</span></div>
-        <div class="region-controls costmap-controls"><label for="map-layer">地图图层</label><select id="map-layer"><option value="occupancy">占据栅格底图</option><option value="cost">底图＋导航代价</option></select><span id="costmap-state">共用同一张栅格底图</span></div>
-        <div id="costmap-legend" class="costmap-legend" hidden><span><i class="cost-lethal"></i>障碍占据</span><span><i class="cost-inscribed"></i>禁行膨胀区</span><span><i class="cost-inflated"></i>通行代价</span><span><i class="cost-unknown"></i>未知</span></div>
-        <div class="region-controls"><label id="export-view-control" for="map-export-view" hidden>导出视图<select id="map-export-view"><option value="cost">导航代价</option><option value="occupancy">栅格底图</option><option value="rooms">房间分区</option><option value="semantic">物品语义与记忆</option><option value="observations">所选任务观察点与朝向</option><option value="clean_trace">所选任务实际清扫轨迹</option><option value="clean_coverage">所选任务实际清扫覆盖</option><option value="relations">房间与物品关系</option></select></label><button id="export-costmap" class="button secondary" type="button" hidden>保存导航代价快照</button><span id="costmap-exports" class="small" aria-live="polite"></span></div>
-        <div id="map-stage" class="map-stage"><canvas id="map" aria-label="占据地图、机器人位置、实测激光、规划路径与物品标记"></canvas><div id="semantic-relations" class="semantic-relations" hidden></div><div id="map-empty" class="map-empty"><span class="map-empty-icon" aria-hidden="true">⌖</span><strong>地图加载中</strong><p>定位和地图就绪后显示机器人位置。</p></div><div id="map-stale" class="map-stale" hidden>地图数据已过期</div></div>
-        <div class="map-footer"><div class="legend"><span><i class="robot-key"></i>机器人</span><span><i class="object-key"></i>已确认物品</span><span id="dock-legend" hidden><i class="dock-key"></i>充电处</span><span><i class="wall-key"></i>障碍</span></div><span id="pose" class="small">位置等待定位</span></div>
-        <p id="map-result-context" class="map-context">物品标记将在任务结果返回后显示。</p>
-      </section>
-      <aside class="results-sidebar">
-        <section class="card execution-card">
+        <div class="task-results">
+          <section class="card execution-card">
           <div class="section-head"><h2 id="task-title">当前任务</h2><span id="task-badge" class="badge neutral">空闲</span></div>
           <p id="active-command" class="active-command">等待你的第一条指令</p>
           <div class="task-facts"><div><span>已用时间</span><strong id="elapsed">—</strong></div><div><span id="task-metric">确认数量</span><strong id="count">—</strong></div></div>
@@ -96,22 +117,54 @@
           <details id="result-details" hidden><summary>查看完整结果</summary><pre id="result-json" class="json-view"></pre></details>
           <button id="show-current" class="text-button" type="button" hidden>返回当前任务</button>
         </section>
+          <section id="task-history" class="card history-card"><div class="section-head"><h2>本次运行记录</h2><span id="history-count" class="eyebrow">0 条</span></div><ul id="history" class="history-list"><li class="empty-row">完成的任务会显示在这里。</li></ul></section>
+        </div>
+      </div>
+      <div class="console-page map-page" data-console-page="map-card" hidden>
+        <section id="map-card" class="card map-card">
+        <div class="section-head map-heading"><div><h2 id="map-title">家庭地图</h2><p id="map-meta" class="small muted">等待地图数据</p></div><div class="map-tools"><button id="zoom-out" type="button" title="缩小地图" aria-label="缩小地图">−</button><button id="zoom-in" type="button" title="放大地图" aria-label="放大地图">＋</button><button id="fit-map" type="button">适应</button></div></div>
+        <div class="map-view-tabs" role="group" aria-label="地图视图"><button type="button" data-map-view="semantic" aria-pressed="true">语义地图</button><button type="button" data-map-view="operation" aria-pressed="false">运行地图</button><button type="button" data-map-view="relations" aria-pressed="false">房间与物品关系</button></div>
+        <div id="semantic-summary" class="semantic-summary" aria-live="polite"></div>
+        <div id="map-stage" class="map-stage"><canvas id="map" aria-label="占据地图、机器人位置、实测激光、规划路径与物品标记"></canvas><div id="semantic-relations" class="semantic-relations" hidden></div><div id="map-empty" class="map-empty"><span class="map-empty-icon" aria-hidden="true">⌖</span><strong>地图加载中</strong><p>定位和地图就绪后显示机器人位置。</p></div><div id="map-stale" class="map-stale" hidden>地图数据已过期</div></div>
+        <div class="map-footer"><div class="legend"><span><i class="robot-key"></i>机器人</span><span><i class="object-key"></i>已确认物品</span><span id="dock-legend" hidden><i class="dock-key"></i>充电处</span><span><i class="wall-key"></i>障碍</span></div><span id="pose" class="small">位置等待定位</span></div>
+        <p id="map-result-context" class="map-context">物品标记将在任务结果返回后显示。</p>
+        <details class="map-settings">
+          <summary>地图图层与导出</summary>
+        <div class="region-controls"><label><input id="show-regions" type="checkbox" checked> 区域轮廓</label><label><input id="show-views" type="checkbox"> 预设巡视点与朝向</label><label><input id="show-memory" type="checkbox" checked> 物品记忆</label><span id="region-note">区域边界可通行，不是墙体</span></div>
+        <p id="view-note" class="view-note" hidden>预设巡视路线，非实时检测位置。</p>
+        <div class="region-controls"><label><input id="show-obstacles" type="checkbox" checked> 实时激光与规划路径</label><span>橙色点为实测障碍，蓝色虚线为规划路径</span></div>
+        <div class="region-controls costmap-controls"><label for="map-layer">地图图层</label><select id="map-layer"><option value="occupancy">占据栅格底图</option><option value="cost">底图＋导航代价</option></select><span id="costmap-state">共用同一张栅格底图</span></div>
+        <div id="costmap-legend" class="costmap-legend" hidden><span><i class="cost-lethal"></i>障碍占据</span><span><i class="cost-inscribed"></i>禁行膨胀区</span><span><i class="cost-inflated"></i>通行代价</span><span><i class="cost-unknown"></i>未知</span></div>
+        <div class="region-controls"><label id="export-view-control" for="map-export-view" hidden>导出视图<select id="map-export-view"><option value="cost">导航代价</option><option value="occupancy">栅格底图</option><option value="rooms">房间分区</option><option value="semantic">物品语义与记忆</option><option value="observations">所选任务观察点与朝向</option><option value="clean_trace">所选任务实际清扫轨迹</option><option value="clean_coverage">所选任务实际清扫覆盖</option><option value="relations">房间与物品关系</option></select></label><button id="export-costmap" class="button secondary" type="button" hidden>保存导航代价快照</button><span id="costmap-exports" class="small" aria-live="polite"></span></div>
+        </details>
+      </section>
         <section class="card memory-card">
           <div class="section-head"><h2>语义物品档案</h2><span id="memory-count" class="eyebrow">等待地图</span></div>
           <div class="form-pair"><div><label for="memory-room">房间</label><select id="memory-room"><option value="">全部房间</option></select></div><div><label for="memory-category">物品</label><select id="memory-category"><option value="">全部物品</option></select></div></div>
           <p id="memory-status" class="small muted">显示最后观测位置，当前位置需要现场核验。</p>
-          <p class="small muted">地图虚线圈为历史位置，棕色表示待核验。展开记录可定位并查看观测依据。</p>
+
           <a id="memory-graph" class="text-button" href="/api/memory/graph" target="_blank" rel="noopener" hidden>导出语义地图</a>
           <div id="memory-objects" class="objects memory-list"></div>
         </section>
-        <section class="card history-card"><div class="section-head"><h2>本次运行记录</h2><span id="history-count" class="eyebrow">0 条</span></div><ul id="history" class="history-list"><li class="empty-row">完成的任务会显示在这里。</li></ul></section>
-      </aside>
-    </div>
-    <section class="card log-card">
+      </div>
+      <div class="console-page" data-console-page="diagnostics" hidden>
+        <div class="diagnostics-grid">
+      <section class="card">
+          <div class="section-head"><h2>系统状态</h2><span id="system-dot" class="dot neutral" aria-label="状态未知"></span></div>
+          <ul id="health" class="health-list"><li><span>机器人连接</span><span class="muted">等待数据</span></li></ul>
+          <details class="topic-details"><summary>传感器数据</summary><ul id="topics" class="topic-list"></ul></details>
+          <button id="validate" class="button secondary" type="button" disabled>检查传感器</button>
+          <p id="validation-state" class="small muted">检查会保存传感器报告，不移动机器人。</p>
+          <div id="validation-artifacts" class="artifact-list"></div>
+        </section>
+      <section class="card log-card">
       <div class="section-head"><div><h2>运行日志</h2><p id="session" class="small muted">本地会话</p></div><div class="log-controls"><label class="sr-only" for="log-component">日志组件</label><select id="log-component"><option value="task">当前任务</option><option value="simulation">Gazebo</option><option value="navigation">导航</option><option value="detector">视觉检测</option><option value="search">搜索</option><option value="rviz">RViz</option></select><button id="refresh-log" class="button secondary compact" type="button">刷新</button></div></div>
       <pre id="log-output" class="log-output">正在读取日志…</pre>
     </section>
-    <footer class="page-footer"><span>地图坐标单位 m</span><span>关闭网页不停止机器人；结束运行请在启动终端按 Ctrl+C。</span></footer>
+    </div>
+      </div>
+    </div>
+    <footer class="page-footer">结束运行请在启动终端按 Ctrl+C。</footer>
   </main>
 </body>
 </html>

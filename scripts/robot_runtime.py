@@ -92,7 +92,7 @@ class Runtime:
                  camera_resolution='640x480',camera_fov=1.02974,cleaning_position_goals=False,
                  cleaning_local_recovery=False, charging_station=True, cleaning_budget_selection=False,
                  memory_guidance=False,ball_model=None,auxiliary_model=None,auxiliary_categories=None,
-                 body_footprint=False,depth_cloud_source='native',precision_docking=False,memory_safe_approach=False):
+                 body_footprint=False,depth_cloud_source='native',precision_docking=False,memory_safe_approach=False,room_doors=False,astar=False,gazebo_preview=False):
         if depth_cloud_source not in ('native','image'):
             raise ValueError('导航点云来源必须为native或image。')
         if (camera_resolution not in ('640x480','1280x960') or type(camera_fov) not in (int,float)
@@ -132,6 +132,8 @@ class Runtime:
         if device not in ('cpu', 'cuda:0'):
             raise ValueError('device必须为cpu或cuda:0')
         self.device = device
+        self.room_doors=room_doors
+        self.gazebo_preview = gazebo_preview
         self.charging_station = None
         self.charging_station_file = None
         if type(domain) is not int or not 0 <= domain <= 232:
@@ -213,9 +215,40 @@ class Runtime:
             from semantic_search.map_resources import canonical_map_yaml, map_receipt
             self.config['map_id']='aws_house_v1'
             self.config['map']=str(canonical_map_yaml(self.root,map_id=self.config['map_id']).relative_to(self.root))
+            if self.room_doors:
+                from semantic_search.room_doors import create_door_map
+                from semantic_search.map_resources import resolve_map
+                door_map=self.session_dir/'door_map'/'house.yaml'
+                create_door_map(self.root/self.config['map'],door_map)
+                self.map_resource=resolve_map(self.root,yaml_path=door_map)
+                self.config['map']=str(door_map.relative_to(self.root))
+                self.config['map_id']='room_doors'
+            self.config['global_planner'] = 'astar_with_dijkstra_fallback' if astar else 'baseline'
+            if astar:
+                import yaml
+                params = yaml.safe_load((self.root / self.navigation_file).read_text())
+                planner = params['planner_server']['ros__parameters']['GridBased']
+                planner.update(plugin='service_navfn/CellCenteredNavfn', use_astar=True)
+                effective = self.session_dir / 'configuration' / 'nav2_astar.yaml'
+                effective.parent.mkdir(exist_ok=True)
+                contents = yaml.safe_dump(params, sort_keys=False).encode()
+                effective.write_bytes(contents)
+                self.config['navigation_effective'] = str(effective.relative_to(self.session_dir))
+                self.config['navigation_effective_sha256'] = hashlib.sha256(contents).hexdigest()
+            self.config['room_doors']=self.room_doors
+            if gazebo_preview:
+                self.config['gazebo_preview'] = True
             self.config['map_resource']=map_receipt(self.map_resource,self.root) if self.map_resource else None
             station_name=('src/semantic_search/config/charging_station_precision.json' if precision_docking
                           else 'src/semantic_search/config/charging_station.json')
+            if self.room_doors and charging_station:
+                station=json.loads((self.root/station_name).read_text())
+                station['map_yaml']=self.config['map']
+                station['map_sha256']=dict(yaml=self.map_resource['yaml_sha256'],
+                                          image=self.map_resource['image_sha256'])
+                path=self.session_dir/'door_map'/'charging_station.json'
+                _save(path,station)
+                station_name=str(path.relative_to(self.root))
             if charging_station and (self.root/station_name).is_file():
                 from semantic_search.docking import load_station
                 self.charging_station=load_station(self.root/station_name,self.root,active_map=self.map_resource)
@@ -417,6 +450,8 @@ class Runtime:
         if name == 'simulation':
             return ['bash', str(self.root / 'scripts/development.sh'),
                     'gui:=' + ('false' if self.headless else 'true'),
+                    'room_doors:='+str(self.room_doors).lower(),
+                    *(['gazebo_preview:=true'] if paths.get('gazebo_preview') else []),
                     'layout_file:=' + paths['layout'],
                     'depth_cloud_source:='+paths.get('depth_cloud_source','native'),
                     'camera_height:='+str(paths['camera_height']), 'camera_pitch:='+str(paths['camera_pitch']),
@@ -429,9 +464,11 @@ class Runtime:
         if name == 'safety':
             return ['ros2','launch','semantic_search','navigation_safety.launch.py']
         if name == 'navigation':
+            effective = paths.get('navigation_effective')
+            navigation = self.session_dir / effective if effective else self.root / paths['navigation']
             return ['bash', str(self.root / 'scripts/development_navigation.sh'),
                     'map:='+str(self.root/paths['map']),
-                    'params_file:='+str(self.root/paths['navigation'])]
+                    'params_file:='+str(navigation)]
         if name == 'slam':
             return ['bash', str(self.root / 'scripts/mapping.sh'), 'scene:=aws_house']
         if name == 'motion':

@@ -15,6 +15,25 @@ from launch_ros.actions import Node
 from semantic_search.development import build_world, rig_frames
 
 
+def add_overview_camera(world):
+    model = ET.SubElement(world, 'model', name='console_overview')
+    ET.SubElement(model, 'static').text = 'true'
+    ET.SubElement(model, 'pose').text = '0 -0.4 17.2 0 1.52 1.5708'
+    link = ET.SubElement(model, 'link', name='mount')
+    sensor = ET.SubElement(link, 'sensor', name='overview', type='camera')
+    ET.SubElement(sensor, 'topic').text = '/gazebo/overview'
+    ET.SubElement(sensor, 'always_on').text = 'true'
+    ET.SubElement(sensor, 'update_rate').text = '4'
+    camera = ET.SubElement(sensor, 'camera')
+    ET.SubElement(camera, 'horizontal_fov').text = '1.15'
+    image = ET.SubElement(camera, 'image')
+    ET.SubElement(image, 'width').text = '800'
+    ET.SubElement(image, 'height').text = '480'
+    ET.SubElement(image, 'format').text = 'R8G8B8'
+    clip = ET.SubElement(camera, 'clip')
+    ET.SubElement(clip, 'near').text = '0.1'
+    ET.SubElement(clip, 'far').text = '60'
+
 def setup(context):
     root = Path(LaunchConfiguration('project_root').perform(context)).resolve()
     depth_source=LaunchConfiguration('depth_cloud_source').perform(context)
@@ -34,6 +53,17 @@ def setup(context):
                         width,image_height,hfov,charging_file or None)
     truth['camera_rig'] = dict(height_m=height,pitch_rad=pitch,image_width=width,
                                image_height=image_height,horizontal_fov_rad=hfov)
+    room_doors=LaunchConfiguration('room_doors').perform(context)=='true'
+    overview = LaunchConfiguration('gazebo_preview').perform(context) == 'true'
+    if room_doors or overview:
+        document = ET.parse(output)
+        world = document.getroot().find('world')
+        if room_doors:
+            from semantic_search.room_doors import DOORS, add_room_doors
+            add_room_doors(world)
+        if overview:
+            add_overview_camera(world)
+        document.write(output, encoding='utf-8', xml_declaration=True)
     # Calibration only: the sensor's own far clip, never scene object truth.
     far_clip=ET.parse(output).find(".//model[@name='waffle']/link[@name='camera_rgb_frame']/sensor/camera/clip/far")
     if far_clip is None:raise ValueError('Verified RGB-D far clip unavailable')
@@ -85,6 +115,19 @@ def setup(context):
              parameters=[cloud_parameters],output='screen'),
         Node(package='ros_gz_bridge',executable='parameter_bridge',name='contact_bridge',
              arguments=bridge[9:],output='screen')]
+    if room_doors:
+        door_bridge=[]
+        for name in DOORS:
+            door_bridge += [f'/doors/{name}/command@std_msgs/msg/Float64]ignition.msgs.Double',
+                            f'/doors/{name}/joint_state@sensor_msgs/msg/JointState[ignition.msgs.Model']
+        bridges.append(Node(package='ros_gz_bridge',executable='parameter_bridge',
+                            name='door_bridge',arguments=door_bridge,output='screen'))
+    if overview:
+        bridges.append(Node(package='ros_gz_bridge', executable='parameter_bridge',
+            name='console_camera_bridge',
+            arguments=['/gazebo/overview@sensor_msgs/msg/Image[ignition.msgs.Image'],
+            parameters=[{'qos_overrides./gazebo/overview.publisher.depth': 1}],
+            output='screen'))
     command = ['ign', 'gazebo', '-r', '-v', '3']
     if LaunchConfiguration('gui').perform(context).lower() != 'true':
         command.append('-s')
@@ -107,6 +150,8 @@ def setup(context):
 def generate_launch_description():
     return LaunchDescription([DeclareLaunchArgument('project_root'),
                               DeclareLaunchArgument('charging_file',default_value=''),
+                              DeclareLaunchArgument('room_doors',default_value='false'),
+                              DeclareLaunchArgument('gazebo_preview',default_value='false'),
                               DeclareLaunchArgument('depth_cloud_source',default_value='native'),
                               DeclareLaunchArgument('gui', default_value='false'),
                               DeclareLaunchArgument('camera_height', default_value='1.0'),

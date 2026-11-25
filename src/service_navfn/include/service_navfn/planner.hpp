@@ -4,8 +4,8 @@
 
 namespace service_navfn
 {
-// Keep the installed NavFn solver and lifecycle/parameters; only coordinate
-// conversion differs from Humble NavfnPlanner's round/grid-line convention.
+// Use cell-centred coordinates. A* mode falls back to Dijkstra for failed
+// extraction and goal-tolerance search.
 class CellCenteredNavfn : public nav2_navfn_planner::NavfnPlanner
 {
 public:

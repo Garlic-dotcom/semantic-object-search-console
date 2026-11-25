@@ -48,7 +48,6 @@ nav_msgs::msg::Path CellCenteredNavfn::createPlan(
   int map_goal[2] = {static_cast<int>(gx), static_cast<int>(gy)};
   planner_->setStart(map_goal);
   planner_->setGoal(map_start);
-  if (use_astar_) {planner_->calcNavFnAstar();} else {planner_->calcNavFnDijkstra(true);}
 
   auto potential = [&](const geometry_msgs::msg::Pose & p) {
       // Geometry is fixed while the global planner is running (map costmap).
@@ -61,22 +60,31 @@ nav_msgs::msg::Path CellCenteredNavfn::createPlan(
       return static_cast<double>(planner_->potarr[y * planner_->nx + x]);
     };
   auto best = goal.pose;
-  bool found = potential(best) < POT_HIGH;
-  if (!found) {
-    double distance = std::numeric_limits<double>::max();
-    auto p = goal.pose;
-    for (p.position.y = g.y - tolerance_; p.position.y <= g.y + tolerance_; p.position.y += resolution) {
-      for (p.position.x = g.x - tolerance_; p.position.x <= g.x + tolerance_; p.position.x += resolution) {
-        const double d = squared_distance(p, goal.pose);
-        if (potential(p) < POT_HIGH && d < distance) {distance = d; best = p; found = true;}
+  int count = 0;
+  if (use_astar_ && planner_->calcNavFnAstar() && potential(best) < POT_HIGH) {
+    count = planner_->calcPath(max_cycles);
+  }
+  // A blocked goal or failed extraction needs the settled Dijkstra field
+  // before selecting a reachable point in the goal tolerance window.
+  if (count == 0) {
+    planner_->calcNavFnDijkstra(true);
+    bool found = potential(best) < POT_HIGH;
+    if (!found) {
+      double distance = std::numeric_limits<double>::max();
+      auto p = goal.pose;
+      for (p.position.y = g.y - tolerance_; p.position.y <= g.y + tolerance_; p.position.y += resolution) {
+        for (p.position.x = g.x - tolerance_; p.position.x <= g.x + tolerance_; p.position.x += resolution) {
+          const double d = squared_distance(p, goal.pose);
+          if (potential(p) < POT_HIGH && d < distance) {distance = d; best = p; found = true;}
+        }
       }
     }
+    if (!found) {return path;}
+    map_goal[0] = static_cast<int>((best.position.x - ox) / resolution);
+    map_goal[1] = static_cast<int>((best.position.y - oy) / resolution);
+    planner_->setStart(map_goal);
+    count = planner_->calcPath(max_cycles);
   }
-  if (!found) {return path;}
-  map_goal[0] = static_cast<int>((best.position.x - ox) / resolution);
-  map_goal[1] = static_cast<int>((best.position.y - oy) / resolution);
-  planner_->setStart(map_goal);
-  const int count = planner_->calcPath(max_cycles);
   if (count == 0) {return path;}
   const auto px = planner_->getPathX(), py = planner_->getPathY();
   for (int i = count - 1; i >= 0; --i) {

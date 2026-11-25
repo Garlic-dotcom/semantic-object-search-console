@@ -122,6 +122,7 @@
     text('map-title', mapping ? '实时建图' : '家庭地图');
     el('command').placeholder = mapping ? '例如：请前进' :
       cleaning ? '例如：请去健身区扫地' : '例如：去厨房找杯子';
+    el('open-nearby-door').hidden = !state?.room_doors;
     el('save-mapping').disabled = !allowed || motion?.status==='moving';
     text('motion-status', motion?.message || '');
     document.querySelector('.region-controls').hidden = mapping;
@@ -129,6 +130,8 @@
     el('submit-task').disabled = !allowed;
     text('submit-task', mutationPending ? '正在提交…' : taskBusy() ? '任务执行中' : allowed ? '开始任务' : '等待系统就绪');
     el('cancel-task').disabled = !online || mutationPending;
+    el('stop-from-page').disabled = el('cancel-task').disabled;
+    el('stop-from-page').hidden = !(taskBusy() || recording || motion?.status === 'moving');
     el('validate').disabled = !allowed;
     el('return-to-dock').hidden = mapping || !state?.charging_station;
     el('return-to-dock').disabled = !allowed;
@@ -263,13 +266,17 @@
     text('task-metric', cleaning ? '可清扫区域覆盖率' : '确认数量');
     text('count', cleaning ? finite(fraction) ? `${(fraction*100).toFixed(1)}%` : '—' :
       finite(count) ? String(count) : '—');
-    const key = JSON.stringify([task && task.id, current, result, progress, task?.return, task && task.error, task && task.save_status, task && task.artifacts, historical]);
+    const key = JSON.stringify([task && task.id, current, result, progress, task?.door_progress, task?.return, task && task.error, task && task.save_status, task && task.artifacts, historical]);
     if (taskKey === key) return;
     taskKey = key;
     let feedback = '选择房间和物品，系统就绪后即可开始。';
     if (task) {
       if (task.error) feedback = String(task.error);
       else if (current === 'canceling') feedback = '已请求停止，正在等待机器人确认。';
+      else if (busyStates.has(current) && task.door_progress) {
+        feedback = {approaching_door:'正在前往门口。', opening_door:'正在开门并等待关节反馈。',
+          closing_door:'正在关门。', crossing_door:'门已打开，正在通过门洞。'}[task.door_progress.stage] || '正在准备门口通行。';
+      }
       else if (busyStates.has(current) && task.return?.state==='running') feedback = '任务结果已保存，正在返回充电处。';
       else if (busyStates.has(current) && task.kind==='return') feedback = '正在返回充电处。';
       else if (busyStates.has(current)) feedback = validation ? '正在检查实际传感器数据和坐标变换。' :
@@ -279,7 +286,7 @@
         cleaning ? cleaningProgress(progress) : progressLabel(progress);
       else if (validation) feedback = result ? result.passed ? '传感器检查通过。详细数据已记录在报告中。' : '传感器检查未通过，请查看报告与日志。' : statusLabel(current);
       else if (voice) feedback = result?.text ? `识别文本\n${result.text}` : statusLabel(current);
-      else if (task.kind === 'motion' || task.kind === 'map_save' || task.kind==='return' || cleaning) feedback = result?.message || statusLabel(current);
+      else if (task.kind === 'motion' || task.kind === 'map_save' || task.kind==='door' || task.kind==='return' || cleaning) feedback = result?.message || statusLabel(current);
       else if (result) {
         const resultLabel = statusLabel(result.status || current);
         feedback = `${resultLabel}${finite(result.count) ? `，已确认 ${result.count} 个${categories[result.category] || result.category || '目标'}。` : '。'}`;
@@ -597,8 +604,9 @@
   }
   function drawMap() {
     memoryHitTargets=[];
-    renderSemanticSummary();
     renderObstacle();
+    if (el('map-card').closest('[data-console-page]').hidden) return;
+    renderSemanticSummary();
     const relations=mapView==='relations';canvas.hidden=relations;el('semantic-relations').hidden=!relations;
     el('zoom-in').disabled=relations;el('zoom-out').disabled=relations;el('fit-map').disabled=relations;
     if (relations) {el('map-empty').hidden=true;renderSemanticRelations();return;}
@@ -942,22 +950,82 @@
     button.addEventListener('click', () => motionCommand(button.dataset.motion));
   });
   el('save-mapping').addEventListener('click', () => mutate('/api/mapping/save', {}, '已开始保存地图。'));
+  const motionKeys = {
+    ArrowUp: ['forward','前进'], KeyW: ['forward','前进'],
+    ArrowDown: ['backward','后退'], KeyS: ['backward','后退'],
+    ArrowLeft: ['left','左转'], KeyA: ['left','左转'],
+    ArrowRight: ['right','右转'], KeyD: ['right','右转'],
+  };
+  let heldKey = null;
+  let keyTimer = null;
+  let keySending = false;
+  let stopQueued = false;
+
+  async function sendHeldKey() {
+    if (keySending || (!heldKey && !stopQueued)) return;
+    const command = stopQueued ? 'stop' : motionKeys[heldKey][0];
+    stopQueued = false;
+    keySending = true;
+    try {
+      const response = await fetch('/api/mapping/keyboard', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({command}), keepalive: command === 'stop',
+        signal: AbortSignal.timeout(1500),
+      });
+      if (!response.ok && command !== 'stop') releaseKey();
+    } catch {
+      if (command !== 'stop') releaseKey();
+    } finally {
+      keySending = false;
+      if (stopQueued) sendHeldKey();
+    }
+  }
+
+  function releaseKey() {
+    if (!heldKey) return;
+    heldKey = null;
+    clearInterval(keyTimer);
+    keyTimer = null;
+    stopQueued = true;
+    sendHeldKey();
+  }
+
   document.addEventListener('keydown', (event) => {
-    if (state?.mode!=='mapping' || event.repeat || event.altKey || event.ctrlKey || event.metaKey ||
-        ['INPUT','TEXTAREA','SELECT','BUTTON'].includes(event.target.tagName)) return;
-    const command = {ArrowUp:'前进',ArrowDown:'后退',ArrowLeft:'左转',ArrowRight:'右转'}[event.key];
-    if (command) { event.preventDefault(); motionCommand(command); }
-    if (event.code==='Space') { event.preventDefault(); el('cancel-task').click(); }
+    if (state?.mode!=='mapping' || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey ||
+        event.target.closest('.topbar, .page-arrows') || activePage === 'diagnostics' ||
+        event.target.isContentEditable || ['INPUT','TEXTAREA','SELECT'].includes(event.target.tagName)) return;
+    if (event.code==='Space' && !event.repeat && !event.target.closest('button, a, summary')) {
+      event.preventDefault();
+      releaseKey();
+      if (!state.keyboard_hold || state.busy) el('cancel-task').click();
+      return;
+    }
+    const action = motionKeys[event.code];
+    if (!action) return;
+    event.preventDefault();
+    if (event.repeat) return;
+    if (!state.keyboard_hold) { motionCommand(action[1]); return; }
+    if (!state.ready || !online || recording || mutationPending) return;
+    heldKey = event.code;
+    if (!keyTimer) keyTimer = setInterval(sendHeldKey,160);
+    sendHeldKey();
   });
+  window.addEventListener('keyup', (event) => {
+    if (event.code === heldKey) releaseKey();
+  });
+  window.addEventListener('blur', releaseKey);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseKey(); });
   el('record-voice').addEventListener('click', recordVoice);
   el('return-to-dock').addEventListener('click', () =>
     mutate('/api/task',{mode:'return',request_id:requestId()},'已开始返回充电处。'));
   el('cancel-task').addEventListener('click', () => {
+    releaseKey();
     if (recording) {
       stopRecording(true);
       announce('已取消录音。');
     } else mutate('/api/cancel', {}, '已提交停止请求，请等待执行状态更新。');
   });
+  el('stop-from-page').addEventListener('click', () => el('cancel-task').click());
   el('validate').addEventListener('click', () => mutate('/api/validate', {}, '开始传感器检查，报告将保存在本次会话中。'));
   el('show-current').addEventListener('click', () => { selectedHistoryId = null; taskKey = ''; renderTask(); });
   el('log-component').addEventListener('change', refreshLog);
@@ -1008,7 +1076,254 @@
     const item=memoryHit(event);if (!item) return;
     selectedMemoryId=item.id;renderMemory();drawMap();
   });
+  const simulationImage = el('simulation-image');
+  const simulationPlaceholder = el('simulation-empty');
+  const cameraButtons = [...document.querySelectorAll('[data-camera]')];
+  let cameraView = null;
+  let cameraUrl = null;
+  let displayedCamera = null;
+  let simulationVisible = true;
+
+  new IntersectionObserver(([entry]) => {
+    simulationVisible = entry.isIntersecting;
+  }).observe(el('simulation-view'));
+
+  function updateCameraButtons(view, overview) {
+    for (const button of cameraButtons) {
+      button.disabled = button.dataset.camera === 'overview' && !overview;
+      button.setAttribute('aria-pressed', String(button.dataset.camera === view));
+    }
+  }
+
+  for (const button of cameraButtons) {
+    button.addEventListener('click', () => {
+      cameraView = button.dataset.camera;
+      updateCameraButtons(cameraView, state?.gazebo_preview);
+      if (simulationImage.hidden) {
+        simulationPlaceholder.hidden = false;
+        simulationPlaceholder.querySelector('p').textContent = '正在切换视角';
+      }
+      text('simulation-status', '正在切换视角');
+    });
+  }
+
+  async function pollCamera() {
+    let delay = 900;
+    try {
+      if (document.hidden || activePage !== 'simulation' || !simulationVisible || !state) return;
+      const overview = Boolean(state.gazebo_preview);
+      const view = cameraView || (overview ? 'overview' : 'robot');
+      updateCameraButtons(view, overview);
+      const reply = await fetch('/api/simulator/frame?view=' + view, {
+        cache: 'no-store', signal: AbortSignal.timeout(1800)
+      });
+      if (!reply.ok) throw new Error(reply.status === 404 ? '重启项目后可接收实时画面' : '正在等待 Gazebo 画面');
+      const frame = await reply.blob();
+      if (cameraView && view !== cameraView) return;
+      if (frame.type !== 'image/jpeg') throw new Error('仿真画面暂不可用');
+      const nextUrl = URL.createObjectURL(frame);
+      const nextImage = new Image();
+      nextImage.src = nextUrl;
+      try {
+        await nextImage.decode();
+      } catch (error) {
+        URL.revokeObjectURL(nextUrl);
+        throw error;
+      }
+      if (cameraView && view !== cameraView) {
+        URL.revokeObjectURL(nextUrl);
+        return;
+      }
+      const previousUrl = cameraUrl;
+      cameraUrl = nextUrl;
+      delay = 250;
+      simulationImage.src = nextUrl;
+      simulationImage.hidden = false;
+      if (displayedCamera !== view && !reducedMotion.matches) {
+        simulationImage.animate([{opacity: .65}, {opacity: 1}], {duration: 200, easing: 'ease-out'});
+      }
+      displayedCamera = view;
+      simulationPlaceholder.hidden = true;
+      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      text('simulation-status', view === 'overview' ? '全屋俯视 · 实时' : '机器人相机 · 实时');
+    } catch (error) {
+      if (simulationImage.hidden) {
+        simulationPlaceholder.hidden = false;
+        simulationPlaceholder.querySelector('p').textContent =
+          error.name === 'TimeoutError' ? 'Gazebo 画面连接超时' : error.message;
+        text('simulation-status', '画面暂不可用');
+      } else {
+        text('simulation-status', '画面暂缓更新 · 保留上一帧');
+      }
+    } finally {
+      setTimeout(pollCamera, delay);
+    }
+  }
+
+  const pages = [...document.querySelectorAll('[data-console-page]')];
+  const pageIds = pages.map(page => page.dataset.consolePage);
+  const pageTitles = ['仿真工作台', '任务管理', '地图与物品', '系统诊断'];
+  const pageLinks = [...document.querySelectorAll('.top-nav [data-page-link]')];
+  const pageSurface = el('console-pages');
+  const pageNav = document.querySelector('.top-nav');
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+  let activePage = 'simulation';
+  let activeTransition = null;
+  let requestedNavigation = 0;
+
+  function positionPageMarker() {
+    const link = pageLinks[pageIds.indexOf(activePage)];
+    pageNav.style.setProperty('--selection-x', link.offsetLeft + 'px');
+    pageNav.style.setProperty('--selection-width', link.offsetWidth + 'px');
+    pageNav.dataset.positioned = '';
+  }
+
+  function switchPage(target, {history = true, animate = true, focus = false} = {}) {
+    const pageId = target === 'task-history' ? 'tasks' : target;
+    const index = pageIds.indexOf(pageId);
+    if (index < 0) return;
+    const request = ++requestedNavigation;
+    const previous = pageIds.indexOf(activePage);
+    const changed = index !== previous;
+    if (changed) releaseKey();
+    if (activeTransition) {
+      activeTransition.skipTransition();
+      activeTransition = null;
+    }
+    const direction = index < previous ? 'previous' : 'next';
+    const motion = animate && changed && !reducedMotion.matches;
+    const canTransition = motion && typeof document.startViewTransition === 'function'
+      && window.scrollY < 48 && !document.hidden;
+    function showPage() {
+      if (request !== requestedNavigation) return;
+      activePage = pageId;
+      pages.forEach((page, i) => {
+        page.hidden = i !== index;
+        delete page.dataset.direction;
+      });
+      pageLinks.forEach((link, i) => {
+        if (i === index) link.setAttribute('aria-current', 'page');
+        else link.removeAttribute('aria-current');
+      });
+      text('page-title', pageTitles[index]);
+      positionPageMarker();
+      if (focus) pageLinks[index].focus({preventScroll: true});
+      el('previous-page').disabled = index === 0;
+      el('next-page').disabled = index === pages.length - 1;
+      if (history && location.hash !== '#' + pageId) window.history.pushState(null, '', '#' + pageId);
+      if (changed) window.scrollTo({top: 0, behavior: 'instant'});
+      if (pageId === 'diagnostics') refreshLog();
+      if (pageId === 'map-card') drawMap();
+    }
+    delete document.documentElement.dataset.consoleMotion;
+    if (canTransition) {
+      document.documentElement.dataset.consoleMotion = direction;
+      const transition = document.startViewTransition(showPage);
+      activeTransition = transition;
+      // Rapid navigation can skip a transition before its snapshots are ready.
+      transition.ready.catch(() => {});
+      const cleanup = () => {
+        if (activeTransition === transition) {
+          delete document.documentElement.dataset.consoleMotion;
+          activeTransition = null;
+        }
+      };
+      transition.finished.then(cleanup, cleanup);
+    } else {
+      showPage();
+      if (motion) pages[index].dataset.direction = direction;
+    }
+  }
+
+  function stepPage(offset, focus = false) {
+    const next = pageIds[pageIds.indexOf(activePage) + offset];
+    if (next) switchPage(next, {focus});
+  }
+
+  function restorePage(event) {
+    const id = location.hash.slice(1);
+    if (event?.type === 'hashchange' && activeTransition) return;
+    switchPage(pageIds.includes(id) || id === 'task-history' ? id : 'simulation',
+      {history: false, animate: event?.type === 'popstate'});
+  }
+
+  document.querySelectorAll('[data-page-link]').forEach(link => {
+    link.addEventListener('click', event => {
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      switchPage(link.hash.slice(1));
+    });
+  });
+  el('previous-page').addEventListener('click', () => stepPage(-1, true));
+  el('next-page').addEventListener('click', () => stepPage(1, true));
+  pageNav.addEventListener('keydown', event => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    stepPage(event.key === 'ArrowLeft' ? -1 : 1, true);
+  });
+  window.addEventListener('popstate', restorePage);
+  window.addEventListener('hashchange', restorePage);
+
+  const ownGesture = 'input, select, textarea, button, a, summary, canvas, pre, #semantic-relations, .memory-list, .history-list';
+  let touchStart = null;
+  pageSurface.addEventListener('touchstart', event => {
+    resetSwipe();
+    if (event.touches.length !== 1 || event.target.closest(ownGesture)) return;
+    const finger = event.touches[0];
+    touchStart = {id: finger.identifier, x: finger.clientX, y: finger.clientY};
+  }, {passive: true});
+  function resetSwipe() {
+    touchStart = null;
+    delete pageSurface.dataset.dragging;
+    pageSurface.style.removeProperty('--page-drag');
+  }
+  pageSurface.addEventListener('touchmove', event => {
+    if (event.touches.length !== 1) { resetSwipe(); return; }
+    if (!touchStart || reducedMotion.matches) return;
+    const finger = event.touches[0];
+    const dx = finger.clientX - touchStart.x;
+    const dy = finger.clientY - touchStart.y;
+    if (Math.abs(dx) < 12 || Math.abs(dx) < 1.4 * Math.abs(dy)) return;
+    const towardPage = pageIds[pageIds.indexOf(activePage) + (dx < 0 ? 1 : -1)];
+    pageSurface.dataset.dragging = '';
+    const shift = Math.max(-28, Math.min(28, dx * (towardPage ? .24 : .10)));
+    pageSurface.style.setProperty('--page-drag', shift + 'px');
+  }, {passive: true});
+  pageSurface.addEventListener('touchcancel', resetSwipe, {passive: true});
+  pageSurface.addEventListener('touchend', event => {
+    if (!touchStart) return;
+    const finger = [...event.changedTouches].find(touch => touch.identifier === touchStart.id);
+    const start = touchStart;
+    resetSwipe();
+    if (!finger) return;
+    const dx = finger.clientX - start.x;
+    const dy = finger.clientY - start.y;
+    if (Math.abs(dx) > 55 && Math.abs(dx) > 1.4 * Math.abs(dy)) stepPage(dx < 0 ? 1 : -1);
+  }, {passive: true});
+
+  let trackpadDistance = 0;
+  let lastWheel = -Infinity;
+  let wheelChanged = false;
+  pageSurface.addEventListener('wheel', event => {
+    if (event.ctrlKey || event.target.closest(ownGesture)
+        || Math.abs(event.deltaX) <= 1.4 * Math.abs(event.deltaY)) return;
+    event.preventDefault();
+    if (event.timeStamp - lastWheel > 180) {
+      trackpadDistance = 0;
+      wheelChanged = false;
+    }
+    lastWheel = event.timeStamp;
+    if (wheelChanged) return;
+    trackpadDistance += event.deltaX * (event.deltaMode === 1 ? 16 : 1);
+    if (Math.abs(trackpadDistance) >= 65) {
+      wheelChanged = true;
+      stepPage(trackpadDistance > 0 ? 1 : -1);
+    }
+  }, {passive: false});
+
+  restorePage();
+  new ResizeObserver(positionPageMarker).observe(pageNav);
   new ResizeObserver(drawMap).observe(el('map-stage'));
-  pollState(); pollMap(); pollCostmap(); pollMemory(); refreshLog();
-  setInterval(refreshLog, 5000);
+  pollState(); pollCamera(); pollMap(); pollCostmap(); pollMemory(); refreshLog();
+  setInterval(() => { if (activePage === 'diagnostics') refreshLog(); }, 5000);
 })();

@@ -54,6 +54,9 @@ class Console:
         self.jobs, self.job, self.validation = {}, None, None
         self.artifacts, self.known_task_ids = {}, set()
         self.uncertain = False
+        self.keyboard_until=0.
+        self.room_doors=getattr(runtime,'room_doors',False)
+        self.gazebo_preview = getattr(runtime, 'gazebo_preview', False)
         self.worker = None
         self.watchers = {}
         self.cancel_timeout = 8.0
@@ -114,6 +117,14 @@ class Console:
                 if (returning or row['kind']=='return') and row['state'] not in TERMINAL:
                     try:result['progress']=json.loads((row['_folder']/'return_progress.json').read_text())
                     except (OSError,ValueError):pass
+                if self.room_doors and row['state'] not in TERMINAL and row['_folder'].is_dir():
+                    folder=row['_folder']
+                    finished=folder/('door_return.json' if returning else 'door_route.json')
+                    if not finished.is_file():
+                        try:
+                            result['door_progress']=json.loads((folder/'door_progress.json').read_text())
+                        except (OSError,ValueError):
+                            pass
                 result['elapsed_seconds'] = round(row.get('_ended', time.monotonic())-row['_started'], 2)
                 return result
             busy = self.job is not None and self.job['state'] not in TERMINAL
@@ -124,7 +135,8 @@ class Console:
                         task=public(self.job), history=history, validation=public(self.validation),
                         rooms=copy.deepcopy(self.rooms), rooms_frame_id="map", rooms_file=self.rooms_file,
                         output_directory=str(self.runtime.session_dir), control_uncertain=self.uncertain,
-                        voice_available=self.voice_available, map_export_available=True,
+                        voice_available=self.voice_available, map_export_available=True, keyboard_hold=True, room_doors=self.room_doors,
+                        gazebo_preview=self.gazebo_preview,
                         map_export_views=['cost',*VIEWS],
                         object_catalog=object_catalog(self.target_categories),
                         charging_station=({k:copy.deepcopy(self.charging_station[k]) for k in
@@ -347,6 +359,8 @@ class Console:
                 raise ApiError(409,'当前无法切换模式。')
             if self.job and self.job['state'] not in TERMINAL:
                 raise ApiError(409,'请先停止当前任务。')
+            if time.monotonic()<self.keyboard_until:
+                raise ApiError(409,'请松开方向键并等待机器人停车。')
             if target==self.mode:
                 return self.snapshot()
             self.phase = 'switching'
@@ -446,11 +460,15 @@ class Console:
                         or not re.fullmatch(r'[A-Za-z0-9_-]{8,80}',request_id)
                         or not isinstance(text,str) or not 0<len(text)<=500):
                     raise ApiError(400,'建图模式接受一条文字运动指令。')
-                try:
-                    command = parse_motion(text)
-                except ValueError as error:
-                    raise ApiError(400,str(error)) from error
-                kind = 'motion'
+                door_command={'开门':'open','关门':'close'}.get(text.strip().rstrip('。'))
+                if self.room_doors and door_command:
+                    kind,command='door',door_command
+                else:
+                    try:
+                        command = parse_motion(text)
+                    except ValueError as error:
+                        raise ApiError(400,str(error)) from error
+                    kind = 'motion'
                 if command=='stop' and self.job and self.job['state'] not in TERMINAL:
                     return self.cancel()
             else:
@@ -462,6 +480,22 @@ class Console:
                     raise ApiError(409, '同一request_id不能用于不同任务。')
                 return self.snapshot()
             return self._start_job(request_id,kind,text,command)
+
+    def keyboard(self,payload):
+        keys={'forward':(1.,0.),'backward':(-1.,0.),'left':(0.,1.),'right':(0.,-1.),'stop':(0.,0.)}
+        command=payload.get('command')
+        if set(payload)!={'command'} or not isinstance(command,str) or command not in keys:
+            raise ApiError(400,'键盘运动指令无效。')
+        with self.lock:
+            if command=='stop':
+                self.monitor.send_keyboard(0.,0.)
+            else:
+                if (self.mode!='mapping' or not self.readiness(self.monitor.snapshot())
+                        or (self.job and self.job['state'] not in TERMINAL)):
+                    raise ApiError(409,'建图模式尚未就绪或正在执行其他任务。')
+                self.monitor.send_keyboard(*keys[command])
+                self.keyboard_until=time.monotonic()+1.1
+        return {'accepted':True}
 
     def save_mapping(self):
         with self.lock:
@@ -485,6 +519,8 @@ class Console:
             return self._start_job(uuid4().hex, 'voice', '语音转写', 'transcribe', audio=audio)
 
     def _start_job(self, request_id, kind, text, command, *, audio=None):
+        if time.monotonic()<self.keyboard_until and command!='stop':
+            raise ApiError(409,'请松开方向键并等待机器人停车。')
         if self.job and self.job['state'] not in TERMINAL:
             raise ApiError(409, '已有任务执行中，请等待结束或停止。')
         if not self.readiness(self.monitor.snapshot()):
@@ -543,12 +579,19 @@ class Console:
             elif kind=='return':
                 argv=[sys.executable,str(ROOT/'scripts/run_return.py'),str(self.charging_station_file),
                       str(folder),'--timeout',str(RETURN_TIMEOUT_SECONDS)]
+            elif kind=='door':
+                argv=[sys.executable,str(ROOT/'scripts/run_door_transit.py'),'door',command,
+                      str(ROOT/self.rooms_file),str(folder)]
             elif kind == 'map_save':
                 argv = ['bash',str(ROOT/'scripts/save_map.sh'),'scene:=aws_house',
                         'map_output:='+str(folder/'map')]
             else:
                 argv = [sys.executable,str(ROOT/'scripts/validate_sensors.py'),'--seconds','10',
                         '--sensor-reliability','reliable','--output',str(folder/'sensors')]
+            if self.room_doors and kind in ('search','clean','return'):
+                room=json.loads(command).get('room','living')
+                argv=self.door_route(kind,room,folder,argv)
+                row['_door_budget']=240
             launch_attempted = True
             process = self.runtime.start_process(row['_process_name'], argv)
             row['_process'] = process
@@ -584,9 +627,18 @@ class Console:
             self.artifacts[key] = path
         return dict(name=name,url='/api/artifact?id='+key,kind=path.suffix.lstrip('.'))
 
+    def door_route(self,kind,room,folder,argv):
+        return [sys.executable,str(ROOT/'scripts/run_door_transit.py'),kind,room,
+                str(ROOT/self.rooms_file),str(folder),*argv]
+
     def _finish_artifacts(self, row, result):
         folder = row['_folder']
         paths = [(folder/'request.json','任务请求')]
+        if (folder/'door_route.json').is_file():
+            paths.append((folder/'door_route.json','门口开合与通行记录'))
+        if row['kind']=='door':
+            artifacts=[self._register(p,label) for p,label in paths]
+            return [a for a in artifacts if a], 'saved' if all(artifacts) else 'partial'
         if row['kind']=='validation':
             paths += [(folder/'sensors/sensors.json','传感器报告'),(folder/'sensors/rgb.png','采样图像')]
         elif row['kind']=='voice':
@@ -672,9 +724,11 @@ class Console:
                 row['_process_name']='return_'+hashlib.sha256(row['id'].encode()).hexdigest()[:32]
                 argv=[sys.executable,str(ROOT/'scripts/run_return.py'),str(self.charging_station_file),
                       str(folder),'--timeout',str(RETURN_TIMEOUT_SECONDS)]
+                if self.room_doors:
+                    argv=self.door_route('return','living',folder,argv)
                 process=self.runtime.start_process(row['_process_name'],argv)
                 row['_process']=process
-            self._wait_client(row,process,RETURN_TIMEOUT_SECONDS+12,started)
+            self._wait_client(row,process,RETURN_TIMEOUT_SECONDS+12+(240 if self.room_doors else 0),started)
             result=json.loads((folder/'return_result.json').read_text())
             confirmed=result.get('navigation_settled') is True
             status=result.get('status')
@@ -699,13 +753,13 @@ class Console:
         process=row['_process']
         limit={'search':self.task_timeout+50,'clean':CLEAN_TIMEOUT_SECONDS+12,
                'return':RETURN_TIMEOUT_SECONDS+12,'motion':78}.get(row['kind'],60)
-        limit=row.get('_timeout_seconds',limit)
+        limit=row.get('_timeout_seconds',limit)+row.get('_door_budget',0)
         folder=row['_folder'];result=None;error=None
         try:
             self._wait_client(row,process,limit,row['_started'])
             filename = {'search':'client_result.json','voice':'transcript.json',
                         'validation':'sensors/sensors.json','motion':'motion.json',
-                        'clean':'clean_result.json','return':'return_result.json'}.get(row['kind'])
+                        'clean':'clean_result.json','return':'return_result.json','door':'door_route.json'}.get(row['kind'])
             result_path = folder/filename if filename else None
             if result_path is not None and result_path.exists():
                 result=json.loads(result_path.read_text())
@@ -747,6 +801,9 @@ class Console:
                     state,result = 'completed',dict(status='completed',message='已保存 YAML 和 PGM 地图。')
                 else:
                     state,error = 'failed','地图保存失败，请检查 SLAM 和任务日志。'
+            elif row['kind']=='door':
+                state=(result or {}).get('status','failed')
+                if state=='failed':error=(result or {}).get('message','门动作未确认。')
             elif row['kind'] in ('clean','return'):
                 if result and result.get('navigation_settled') is True and result.get('status') in TERMINAL:
                     state = result['status']
@@ -830,6 +887,8 @@ class Console:
 
     def cancel(self):
         with self.lock:
+            if time.monotonic()<self.keyboard_until:
+                self.monitor.send_keyboard(0.,0.)
             if self.job and self.job['state'] not in TERMINAL:
                 if self.job['state']!='canceling':
                     self.job['state']='canceling'
@@ -901,7 +960,7 @@ def handler_for(console):
             self.send_header('Content-Length',str(len(body)))
             self.send_header('Cache-Control','no-store')
             self.send_header('X-Content-Type-Options','nosniff')
-            self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'")
+            self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; frame-ancestors 'none'")
             self.end_headers()
             try:self.wfile.write(body)
             except (BrokenPipeError,ConnectionResetError):pass
@@ -920,6 +979,16 @@ def handler_for(console):
             try:
                 self.same_origin()
                 url=urlsplit(self.path)
+                if url.path == '/api/simulator/frame':
+                    view = parse_qs(url.query).get('view', ['robot'])[0]
+                    if view not in ('robot', 'overview'):
+                        raise ApiError(400, '未知仿真视角。')
+                    if view == 'overview' and not console.gazebo_preview:
+                        raise ApiError(404, '启动时添加 --gazebo-preview 可开启全屋视角。')
+                    frame = console.monitor.camera_frame(view)
+                    if frame is None:
+                        raise ApiError(503, '等待 Gazebo 画面。')
+                    return self.send_bytes(200, frame, 'image/jpeg')
                 if url.path=='/api/state':return self.reply(200,console.snapshot())
                 if url.path=='/api/map':
                     value=console.monitor.map_snapshot()
@@ -978,6 +1047,7 @@ def handler_for(console):
                 if not isinstance(data,dict):raise ApiError(400,'请求必须为JSON对象。')
                 if self.path=='/api/task':result=console.submit(data)
                 elif self.path=='/api/cancel':result=console.cancel()
+                elif self.path=='/api/mapping/keyboard':result=console.keyboard(data)
                 elif self.path=='/api/validate':result=console.validate()
                 elif self.path=='/api/mode':result=console.switch_mode(data)
                 elif self.path=='/api/mapping/save':result=console.save_mapping()
@@ -993,8 +1063,11 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--domain',type=int,default=66)
     parser.add_argument('--port',type=int,default=8765)
+    parser.add_argument('--gazebo-preview',action='store_true',help='在网页显示 Gazebo 全屋俯视画面')
     parser.add_argument('--headless',action='store_true',help='不启动Gazebo GUI和RViz，保留网页与真实仿真')
     parser.add_argument('--no-browser',action='store_true')
+    parser.add_argument('--astar',action='store_true',help='试用 A* 全局规划，失败时回退 Dijkstra')
+    parser.add_argument('--room-doors',action='store_true',help='启用带电动门的独立场景')
     parser.add_argument('--startup-timeout',type=float,default=180)
     parser.add_argument('--task-timeout',type=float,default=480)
     parser.add_argument('--rooms-file',help='验证时显式选择项目内房间JSON，默认五区v4')
@@ -1049,7 +1122,8 @@ def main():
                         depth_cloud_source=args.depth_cloud_source,
                         active_observation=args.active_observation,image_size=args.image_size,
                         memory_guidance=args.memory_guidance,
-                        memory_safe_approach=args.memory_safe_approach,
+                        memory_safe_approach=args.memory_safe_approach,room_doors=args.room_doors,astar=args.astar,
+                        gazebo_preview=args.gazebo_preview,
                         navigation_safety=args.navigation_safety,body_footprint=args.body_footprint,model=args.model,ball_model=args.ball_model,
                         auxiliary_model=args.auxiliary_model,auxiliary_categories=args.auxiliary_categories,
                         cleaning_position_goals=args.cleaning_position_goals,

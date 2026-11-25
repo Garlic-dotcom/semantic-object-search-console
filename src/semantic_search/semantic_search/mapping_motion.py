@@ -119,7 +119,7 @@ class MappingMotion(Node):
     def event(self, command, status, message, **detail):
         result = dict(request_id=command.get('id'), command=command.get('mode'),
                       source=command.get('source'), status=status, message=message,
-                      speed_m_s=self.speed, **detail)
+                      speed_m_s=max(.22,self.speed) if command.get('source')=='keyboard' else self.speed, **detail)
         self.last_state = result
         self.states.publish(String(data=json.dumps(result,ensure_ascii=False)))
         if status != 'moving':
@@ -133,7 +133,7 @@ class MappingMotion(Node):
         self.twist()
         if operation:
             if operation['source']=='keyboard':
-                self.keyboard_latched = True
+                self.keyboard_latched = status in ('blocked','rejected')
             self.event(operation,status,message,**details)
 
     def receive_command(self, message):
@@ -178,20 +178,23 @@ class MappingMotion(Node):
                 self.event(command,'rejected',str(error))
 
     def receive_keyboard(self, message):
-        linear, angular = message.linear.x,message.angular.z
+        linear,angular=message.linear.x,message.angular.z
         if not (math.isfinite(linear) and math.isfinite(angular)):
             return
         if not linear and not angular:
-            self.finish('canceled','键盘停止，机器人已停车。')
-            self.keyboard_latched = False
+            if self.active and self.active['source']=='keyboard':
+                self.finish('canceled','键盘已松开，机器人已停车。')
+            self.keyboard_latched=False
             return
-        if self.active or self.keyboard_latched:
+        if self.keyboard_latched or (self.active and self.active['source']!='keyboard'):
             return
-        mode = ('forward' if linear>0 else 'backward') if linear else ('left' if angular>0 else 'right')
-        command = dict(id=None,mode=mode,source='keyboard',deadline=time.monotonic()+PULSE_SECONDS,route=None)
-        if self.active is None:
-            self.event(command,'moving','正在执行键盘运动。')
-        self.active = command
+        mode=('forward' if linear>0 else 'backward') if linear else ('left' if angular>0 else 'right')
+        deadline=time.monotonic()+.7
+        if self.active:
+            self.active.update(mode=mode,deadline=deadline)
+            return
+        self.active=dict(id=None,mode=mode,source='keyboard',route=None,deadline=deadline)
+        self.event(self.active,'moving','正在执行键盘运动。')
 
     def step(self):
         now = time.monotonic()
@@ -204,6 +207,9 @@ class MappingMotion(Node):
             return
         mode = job['mode']
         if now>=job['deadline']:
+            if job['source']=='keyboard':
+                self.finish('canceled','键盘信号已停止，机器人已停车。')
+                return
             detour = mode=='detour'
             self.finish('failed' if detour else 'completed',
                         '绕行超时，已停车。' if detour else '本次短时运动结束，已停车。')
@@ -226,7 +232,8 @@ class MappingMotion(Node):
                 linear = .12 if abs(error)<.18 else 0.
                 angular = min(MAX_TURN,max(-MAX_TURN,1.4*error))
             else:
-                linear = {'forward':self.speed,'backward':-self.speed}.get(mode,0.)
+                speed = max(self.speed,.22) if job['source']=='keyboard' else self.speed
+                linear = {'forward':speed,'backward':-speed}.get(mode,0.)
                 angular = {'left':.55,'right':-.55}.get(mode,0.)
             distance = obstacle(points,linear,angular)
             if distance is not None:

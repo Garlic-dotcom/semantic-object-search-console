@@ -5,6 +5,7 @@ The monitor owns only its node/context, and never sends a robot command. All
 freshness calculations use monotonic receipt time plus the observed /clock.
 """
 from copy import deepcopy
+from io import BytesIO
 import json
 import math
 import os
@@ -365,6 +366,52 @@ class Monitor:
         self._stop = threading.Event()
         self._thread = None
         self._thread_lock = threading.Lock()
+        self._keyboard_lock = threading.Lock()
+        self._keyboard_pending = None
+        self._camera_lock = threading.Lock()
+        self._camera_requests = {}
+        self._camera_messages = {}
+        self._camera_jpegs = {}
+
+    def _receive_camera(self, view, message):
+        now = time.monotonic()
+        with self._camera_lock:
+            previous = self._camera_messages.get(view)
+            if (now - self._camera_requests.get(view, -math.inf) <= 2.
+                    and (previous is None or now - previous[0] >= .23)):
+                self._camera_messages[view] = (now, message)
+
+    def camera_frame(self, view):
+        from PIL import Image
+
+        now = time.monotonic()
+        with self._camera_lock:
+            self._camera_requests[view] = now
+            sample = self._camera_messages.get(view)
+            if sample is None or now - sample[0] > 2.:
+                return None
+            receipt, message = sample
+            cached = self._camera_jpegs.get(view)
+            if cached is not None and cached[0] == receipt:
+                return cached[1]
+            formats = {'rgb8': ('RGB', 3), 'bgr8': ('BGR', 3),
+                       'rgba8': ('RGBA', 4), 'bgra8': ('BGRA', 4)}
+            pixel_format = formats.get(message.encoding.lower())
+            if pixel_format is None or not (0 < message.width <= 2048 and 0 < message.height <= 2048):
+                return None
+            encoding, channels = pixel_format
+            if message.step < channels * message.width or len(message.data) != message.step * message.height:
+                return None
+            mode = 'RGBA' if channels == 4 else 'RGB'
+            frame = Image.frombytes(mode, (message.width, message.height),
+                                    bytes(message.data), 'raw', encoding, message.step, 1)
+            frame.thumbnail((960, 600))
+            output = BytesIO()
+            frame.convert('RGB').save(output, format='JPEG', quality=76)
+            result = output.getvalue()
+            self._camera_jpegs[view] = (receipt, result)
+            return result
+
 
     def start(self):
         with self._thread_lock:
@@ -390,6 +437,10 @@ class Monitor:
     def foreign_stack_present(self):
         return self.snapshot()['foreign_stack']
 
+    def send_keyboard(self,linear,angular):
+        with self._keyboard_lock:
+            self._keyboard_pending=(time.monotonic(),linear,angular)
+
     def close(self):
         self._stop.set()
         if self._thread is not None and self._thread is not threading.current_thread():
@@ -401,6 +452,7 @@ class Monitor:
         context = node = executor = None
         try:
             import rclpy
+            from geometry_msgs.msg import Twist
             from lifecycle_msgs.srv import GetState
             from nav_msgs.msg import OccupancyGrid, Odometry
             from nav_msgs.msg import Path
@@ -425,6 +477,7 @@ class Monitor:
                         parameter_overrides=[Parameter('use_sim_time', value=True)])
             executor = SingleThreadedExecutor(context=context)
             executor.add_node(node)
+            keyboard=node.create_publisher(Twist,'/mapping/keyboard',1)
             buffer = Buffer()
             listener = TransformListener(buffer, node)
             reliable = sensor_qos_profile('reliable')
@@ -457,13 +510,17 @@ class Monitor:
                 def receive(message, name=topic):
                     stamp = message.clock if name == '/clock' else message.header.stamp
                     self.store.receive(name, stamp_seconds(stamp))
-                    if name=='/scan':observe_scan(message)
+                    if name == '/rgbd/image': self._receive_camera('robot', message)
+                    elif name=='/scan':observe_scan(message)
                     elif name=='/odom':
                         with self.store.lock:self.store.obstacle.motion(message.twist.twist.linear.x,message.twist.twist.angular.z)
                 # The adapter publishes obstacles BEST_EFFORT; all image bridge
                 # outputs and detector results in this candidate are RELIABLE.
                 qos = best_effort if topic == '/rgbd/obstacles' else reliable
                 subscriptions.append(node.create_subscription(kind, topic, receive, qos))
+            subscriptions.append(node.create_subscription(
+                Image, '/gazebo/overview', lambda message: self._receive_camera('overview', message),
+                best_effort))
             def receive_command(message):
                 with self.store.lock:self.store.obstacle.motion(message.linear.x,message.angular.z,command=True)
             subscriptions.append(node.create_subscription(Twist,'/cmd_vel',receive_command,best_effort))
@@ -510,6 +567,14 @@ class Monitor:
             while not self._stop.is_set() and context.ok():
                 executor.spin_once(timeout_sec=.05)
                 now = time.monotonic()
+                with self._keyboard_lock:
+                    pending_keys,self._keyboard_pending=self._keyboard_pending,None
+                if pending_keys is not None:
+                    at,linear,angular=pending_keys
+                    msg=Twist()
+                    if now-at<.35:
+                        msg.linear.x,msg.angular.z=linear,angular
+                    keyboard.publish(msg)
                 if now-last_graph >= .5:
                     names = [('/'+namespace.strip('/')+'/'+name).replace('//', '/')
                              for name, namespace in node.get_node_names_and_namespaces()
